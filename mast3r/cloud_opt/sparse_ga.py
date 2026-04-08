@@ -222,6 +222,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
         K = init_values.get('intrinsics')
         if K is not None:
+            print(f' >> Using user-provided intrinsics for img=...{img[-25:]} [{idx}]')
             K = K.detach()
             focal = K[:2, :2].diag().mean()
             pp = K[:2, 2]
@@ -249,11 +250,37 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     # intrinsics parameters
     if shared_intrinsics:
         # Optimize a single set of intrinsics for all cameras. Use averages as init.
-        confs = torch.stack([torch.load(pth)[0][2].mean() for pth in canonical_paths]).to(pps)
-        weighting = confs / confs.sum()
-        pp = nn.Parameter((weighting @ pps).to(dtype))
+        # Check if user provided intrinsics for any images
+        has_user_intrinsics = [init.get(img, {}).get('intrinsics') is not None for img in imgs]
+        
+        if any(has_user_intrinsics):
+            # If user provided intrinsics, prioritize them
+            if all(has_user_intrinsics):
+                # All images have user-provided intrinsics: use simple average
+                if verbose:
+                    print(' >> Using user-provided intrinsics for shared_intrinsics (simple average)')
+                pp = nn.Parameter(pps.mean(dim=0).to(dtype))
+                focal_m = base_focals.mean()
+            else:
+                # Only some images have user-provided intrinsics: use weighted average
+                # but give higher weight to user-provided values
+                if verbose:
+                    print(f' >> Using user-provided intrinsics for {sum(has_user_intrinsics)}/{len(imgs)} images (weighted average)')
+                confs = torch.stack([torch.load(pth)[0][2].mean() for pth in canonical_paths]).to(pps)
+                # Increase weight for user-provided intrinsics
+                user_weight = torch.tensor([10.0 if has_user else 1.0 for has_user in has_user_intrinsics], 
+                                          device=confs.device, dtype=confs.dtype)
+                weighting = (confs * user_weight) / (confs * user_weight).sum()
+                pp = nn.Parameter((weighting @ pps).to(dtype))
+                focal_m = weighting @ base_focals
+        else:
+            # No user-provided intrinsics: use confidence-weighted average from model predictions
+            confs = torch.stack([torch.load(pth)[0][2].mean() for pth in canonical_paths]).to(pps)
+            weighting = confs / confs.sum()
+            pp = nn.Parameter((weighting @ pps).to(dtype))
+            focal_m = weighting @ base_focals
+        
         pps = [pp for _ in range(len(imgs))]
-        focal_m = weighting @ base_focals
         log_focal = nn.Parameter(focal_m.view(1).log().to(dtype))
         log_focals = [log_focal for _ in range(len(imgs))]
     else:
@@ -1076,3 +1103,101 @@ def show_reconstruction(shapes_or_imgs, K, cam2w, pts3d, gt_cam2w=None, gt_K=Non
             else:
                 viz.add_pointcloud(to_numpy(p), mask=masks[i], color=imgs[i])
     viz.show(**kw)
+
+
+def prepare_intrinsics_init(intrinsics_original, img_paths, original_sizes=None, resized_sizes=None, device='cuda', dtype=torch.float32):
+    """
+    准备内参矩阵作为优化的初值。
+    
+    Args:
+        intrinsics_original: 原始内参矩阵（resize前），可以是：
+            - numpy array: shape (3, 3) 或 (N, 3, 3) 对于多张图像
+            - torch.Tensor: shape (3, 3) 或 (N, 3, 3)
+        img_paths: 图像路径列表，长度应该与内参矩阵数量匹配
+        original_sizes: 原始图像尺寸列表，格式为 [(W1, H1), (W2, H2), ...] 或 None
+            如果为None，将从内参矩阵的principal point推断
+        resized_sizes: resize后的图像尺寸列表，格式为 [(W1, H1), (W2, H2), ...] 或 None
+            如果为None，假设图像没有被resize
+        device: 设备
+        dtype: 数据类型
+    
+    Returns:
+        init字典，格式为 {img_path: {'intrinsics': K_tensor}}
+    
+    Example:
+        # 单张图像，使用resize前的内参矩阵
+        K_orig = np.array([[654.44445801, 0, 640.659729],
+                          [0, 652.97558594, 360.47012329],
+                          [0, 0, 1]])
+        # 假设原始图像尺寸为 (1281, 721)，resize后为 (640, 360)
+        init = prepare_intrinsics_init(K_orig, ['path/to/image.jpg'], 
+                                      original_sizes=[(1281, 721)],  # resize前的尺寸
+                                      resized_sizes=[(640, 360)])      # resize后的尺寸
+        
+        # 然后在调用 sparse_global_alignment 时传入
+        # scene = sparse_global_alignment(imgs, pairs, cache_path, model, init=init, ...)
+        
+        # 多张图像（相同内参）
+        init = prepare_intrinsics_init(K_orig, img_paths, 
+                                      original_sizes=[(1281, 721)] * len(img_paths),
+                                      resized_sizes=[(640, 360)] * len(img_paths))
+        
+        # 如果图像没有被resize，可以省略 resized_sizes
+        # init = prepare_intrinsics_init(K_orig, img_paths, 
+        #                               original_sizes=[(1281, 721)] * len(img_paths))
+    """
+    # 转换为torch tensor
+    if isinstance(intrinsics_original, np.ndarray):
+        intrinsics_original = torch.from_numpy(intrinsics_original).float()
+    else:
+        intrinsics_original = intrinsics_original.float()
+    
+    # 确保是3D tensor (N, 3, 3)
+    if intrinsics_original.ndim == 2:
+        intrinsics_original = intrinsics_original.unsqueeze(0)
+    
+    n_images = len(img_paths)
+    if intrinsics_original.shape[0] == 1 and n_images > 1:
+        # 如果只提供了一个内参矩阵，复制给所有图像
+        intrinsics_original = intrinsics_original.expand(n_images, -1, -1)
+    
+    assert intrinsics_original.shape[0] == n_images, \
+        f"内参矩阵数量 ({intrinsics_original.shape[0]}) 与图像数量 ({n_images}) 不匹配"
+    
+    # 处理图像尺寸
+    if original_sizes is None:
+        # 从principal point推断原始尺寸（假设principal point在图像中心附近）
+        # 使用 2 * principal_point 作为近似尺寸
+        pp = intrinsics_original[:, :2, 2]  # (N, 2)
+        original_sizes = [(int(pp[i, 0] * 2), int(pp[i, 1] * 2)) for i in range(n_images)]
+    
+    if resized_sizes is None:
+        # 假设没有resize
+        resized_sizes = original_sizes
+    
+    # 计算缩放因子
+    init_dict = {}
+    for i, img_path in enumerate(img_paths):
+        K_orig = intrinsics_original[i]
+        orig_w, orig_h = original_sizes[i]
+        resize_w, resize_h = resized_sizes[i]
+        
+        # 计算缩放因子
+        scale_x = resize_w / orig_w
+        scale_y = resize_h / orig_h
+        
+        # 缩放内参矩阵
+        # focal length 按比例缩放
+        # principal point 按比例缩放
+        K_scaled = K_orig.clone()
+        K_scaled[0, 0] *= scale_x  # fx
+        K_scaled[1, 1] *= scale_y  # fy
+        K_scaled[0, 2] *= scale_x  # cx
+        K_scaled[1, 2] *= scale_y  # cy
+        
+        # 移动到指定设备
+        K_scaled = K_scaled.to(device=device, dtype=dtype)
+        
+        init_dict[img_path] = {'intrinsics': K_scaled}
+    
+    return init_dict
